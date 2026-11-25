@@ -117,11 +117,14 @@ def parse_challenge(value: str) -> Dict[str, object]:
     """Parse a ``WWW-Authenticate: Digest ...`` field value."""
     params = _scheme_params(value, "Digest")
     raw_qop = params.get("qop")
+    qop: List[str] = []
+    if raw_qop:
+        qop = [item.strip() for item in raw_qop.split(",") if item.strip()]
     return {
         "realm": params.get("realm", ""),
         "nonce": params.get("nonce", ""),
-        "qop": raw_qop if raw_qop else [],
-        "algorithm": params.get("algorithm") or "SHA-256",
+        "qop": qop,
+        "algorithm": params.get("algorithm") or "MD5",
         "opaque": params.get("opaque"),
         "stale": (params.get("stale") or "").lower() == "true",
     }
@@ -130,11 +133,8 @@ def parse_challenge(value: str) -> Dict[str, object]:
 def parse_authorization(value: str) -> Dict[str, object]:
     """Parse an ``Authorization: Digest ...`` field value."""
     params = _scheme_params(value, "Digest")
-    username = params.get("username")
-    if username is not None:
-        username = username.lower()
     return {
-        "username": username,
+        "username": params.get("username"),
         "realm": params.get("realm"),
         "nonce": params.get("nonce"),
         "uri": params.get("uri"),
@@ -155,14 +155,14 @@ def _a1(
     nonce: Optional[str],
     cnonce: Optional[str],
 ) -> str:
-    base = hash_hex(algorithm, password)
+    base = hash_hex(algorithm, "%s:%s:%s" % (username, realm, password))
     if _is_sess(algorithm):
-        return hash_hex(algorithm, base)
+        base = hash_hex(algorithm, "%s:%s:%s" % (base, nonce, cnonce))
     return base
 
 
 def _ha2(algorithm: str, method: str, uri: str) -> str:
-    return hash_hex(algorithm, "%s:%s" % (method, uri.split("?")[0]))
+    return hash_hex(algorithm, "%s:%s" % (method, uri))
 
 
 def _response(
@@ -256,7 +256,7 @@ def verify(
         return _fail("unknown-user")
 
     qop = auth.get("qop")
-    if qop is not None and qop not in ("auth", "auth-int"):
+    if qop is not None and qop != "auth":
         return _fail("unsupported-qop")
 
     entry = nonce_store.get(str(auth["nonce"]))
@@ -266,16 +266,22 @@ def verify(
         expires_in = int(entry.get("expires_in", 0))
     except (TypeError, ValueError):
         return _fail("stale-nonce")
-    if expires_in < 0:
+    if expires_in <= 0:
         return _fail("stale-nonce")
+
+    expected_opaque = entry.get("opaque")
+    if expected_opaque is not None and auth.get("opaque") != expected_opaque:
+        return _fail("bad-opaque")
 
     nc_value = auth.get("nc")
     cnonce = auth.get("cnonce")
+    nc_int: Optional[int] = None
     if qop is not None:
         if not nc_value or not _NC_RE.match(str(nc_value)) or not cnonce:
             return _fail("missing-field")
+        nc_int = int(str(nc_value), 16)
         last = entry.get("nc")
-        if last is not None and str(nc_value) <= str(last):
+        if last is not None and nc_int <= int(last):
             return _fail("replay")
 
     expected = _response(
@@ -294,6 +300,6 @@ def verify(
     if expected != received:
         return _fail("bad-response")
 
-    if qop is not None and nc_value is not None:
-        entry["nc"] = str(nc_value)
+    if nc_int is not None:
+        entry["nc"] = nc_int
     return {"ok": True, "username": username, "reason": ""}
